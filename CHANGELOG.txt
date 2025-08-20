@@ -1,0 +1,6 @@
+v0.1.0 — Initial release
+- One-file Streamlit app to build a cross-site internal linking index from sitemaps
+- Semantic similarity (all-MiniLM-L6-v2) + pet-topic ontology scoring
+- “Find by URL” and “Find by pasted text” flows
+- Same-site preference toggle, CSV export
+- Auto-discovery of /sitemap_index.xml or /sitemap.xml for each site
