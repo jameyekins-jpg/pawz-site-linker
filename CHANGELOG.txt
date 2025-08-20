@@ -1,9 +1,5 @@
-v0.3.1 — Faster UX + controls
-- Per-site checkboxes before building (choose exactly which domains to crawl)
-- Big, visible 'BUILD / REFRESH INDEX' button (always on the page)
-- Speed controls: max pages per site, concurrency (threads), and path filters
-- Reuses cached pages unless 'Force re-crawl' is checked (much faster)
-
-v0.3.0 — Ultra‑light build
-- Removed scikit‑learn, numpy, pandas to eliminate heavy wheels
-- Implemented pure‑Python TF‑IDF + cosine similarity
+v0.3.3 — UX + speed + crash fix
+- Build button moved to the **bottom** of the page
+- Faster sitemap discovery using robots.txt hints, concurrent HEAD probes, and caching
+- Fixed crash by replacing `st.experimental_rerun()` with `st.rerun()`
+- Keeps per-site checkboxes, concurrency, per-site page cap, and exclude filters

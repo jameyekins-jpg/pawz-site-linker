@@ -1,13 +1,14 @@
 # site_linker.py
 # ------------------------------------------------------------
-# Site Linker — Ultra‑light v0.3.1
+# Site Linker — Ultra‑light v0.3.3
 # - Pure‑Python TF‑IDF (no sklearn/numpy/pandas)
-# - Per‑site checkboxes (choose which sites to crawl BEFORE building)
-# - Big visible BUILD/REFRESH button (not hidden)
-# - Fast scan options: max pages per site + concurrency + path filters
+# - Per‑site checkboxes, speed controls, exclude filters
+# - FAST sitemap discovery: robots.txt + concurrent HEAD + cache
+# - **Build button is at the very bottom of the page**
+# - Fix: uses st.rerun() (no experimental rerun crash)
 # ------------------------------------------------------------
 
-import os, pickle, math, re, time
+import os, pickle, math, re, time, json
 from typing import List, Tuple, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -26,12 +27,8 @@ ALL_SITES = [
     "https://seniorpups.com",
 ]
 
-SITEMAP_CANDIDATES = [
-    "/sitemap_index.xml",
-    "/sitemap.xml",
-    "/sitemap_index.xml.gz",
-    "/sitemap.xml.gz",
-]
+SITEMAP_CANDIDATES_BASE = ["/sitemap_index.xml", "/sitemap.xml"]
+SITEMAP_CANDIDATES_GZ   = ["/sitemap_index.xml.gz", "/sitemap.xml.gz"]
 
 # Common non‑article paths to ignore
 DEFAULT_EXCLUDE_SUBSTRINGS = [
@@ -66,7 +63,10 @@ ONTOLOGY = {
 CACHE_DIR = "data"
 ARTICLES_PKL = os.path.join(CACHE_DIR, "articles.pkl")
 LITE_PKL     = os.path.join(CACHE_DIR, "lite_index.pkl")
-REQUEST_TIMEOUT = 15
+SITEMAP_CACHE_JSON = os.path.join(CACHE_DIR, "sitemaps_cache.json")
+
+REQ_TIMEOUT = 8      # request timeout
+HEAD_TIMEOUT = 5     # HEAD timeout
 MAX_URLS_PER_SITEMAP = 5000  # hard safety cap
 
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -82,46 +82,142 @@ those through to too under until up very was we were what when where which while
 who whom why with you your yours yourself yourselves
 """.split())
 
-# ---------------------- HELPERS ----------------------------------
+# ---------------------- HTTP helpers ----------------------------------
 def user_agent() -> Dict[str, str]:
     return {"User-Agent": "Mozilla/5.0 (compatible; SiteLinker/ultra/1.0)"}
 
-def fetch(url: str) -> Optional[bytes]:
+def http_head(url: str, timeout: int = HEAD_TIMEOUT) -> Optional[requests.Response]:
     try:
-        r = requests.get(url, timeout=REQUEST_TIMEOUT, headers=user_agent())
-        if r.status_code == 200:
+        r = requests.head(url, headers=user_agent(), allow_redirects=True, timeout=timeout)
+        return r
+    except Exception:
+        return None
+
+def http_get(url: str, timeout: int = REQ_TIMEOUT, first_bytes: Optional[int] = None) -> Optional[bytes]:
+    try:
+        headers = user_agent().copy()
+        if first_bytes:
+            headers["Range"] = f"bytes=0-{first_bytes-1}"
+        r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+        if r.status_code == 200 or (r.status_code == 206 and first_bytes):
             return r.content
     except Exception:
         pass
     return None
 
-def fetch_many(urls: List[str], max_workers: int = 8) -> Dict[str, Optional[bytes]]:
-    """Concurrent fetch of many URLs (requests + threads)."""
-    out: Dict[str, Optional[bytes]] = {}
+# ---------------------- Sitemap discovery (fast) -----------------------
+def discover_from_robots(site: str, timeout: int) -> List[str]:
+    urls = []
+    robots = http_get(site.rstrip("/") + "/robots.txt", timeout=timeout, first_bytes=4096)
+    if not robots:
+        return urls
+    try:
+        text = robots.decode("utf-8", errors="ignore")
+        for line in text.splitlines():
+            if line.lower().startswith("sitemap:"):
+                sm = line.split(":", 1)[1].strip()
+                if sm:
+                    urls.append(sm)
+    except Exception:
+        pass
+    return urls
+
+def candidate_sitemaps_for_site(site: str, include_gz: bool) -> List[str]:
+    cands = [site.rstrip("/") + p for p in SITEMAP_CANDIDATES_BASE]
+    if include_gz:
+        cands += [site.rstrip("/") + p for p in SITEMAP_CANDIDATES_GZ]
+    return cands
+
+def is_xmlish(headers: Dict[str, str], url: str) -> bool:
+    ct = (headers.get("Content-Type") or "").lower()
+    if "xml" in ct or "text/xml" in ct or "application/xml" in ct:
+        return True
+    if url.endswith(".xml") or url.endswith(".xml.gz"):
+        return True
+    if "gzip" in ct and url.endswith(".gz"):
+        return True
+    return False
+
+def discover_sitemaps_fast(
+    sites: List[str],
+    use_cache: bool = True,
+    check_robots: bool = True,
+    include_gz: bool = False,
+    max_workers: int = 12,
+    head_timeout: int = HEAD_TIMEOUT
+) -> List[str]:
+    # Load cache
+    cached: Dict[str, List[str]] = {}
+    if use_cache and os.path.exists(SITEMAP_CACHE_JSON):
+        try:
+            with open(SITEMAP_CACHE_JSON, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+        except Exception:
+            cached = {}
+
+    results: Dict[str, List[str]] = {s: list(cached.get(s, [])) for s in sites}
+
+    # robots.txt hints
+    if check_robots:
+        for s in sites:
+            if not results[s]:  # only if no cache
+                hints = discover_from_robots(s, timeout=4)
+                if hints:
+                    results[s].extend(hints)
+
+    # Build candidate list for remaining
+    to_probe: List[Tuple[str, str]] = []  # (site, candidate_url)
+    for s in sites:
+        if results[s]:
+            continue
+        for c in candidate_sitemaps_for_site(s, include_gz=include_gz):
+            to_probe.append((s, c))
+
+    # Concurrent HEAD probes (fast)
+    def head_one(item):
+        s, url = item
+        r = http_head(url, timeout=head_timeout)
+        ok = (r is not None) and (r.status_code == 200) and is_xmlish(r.headers, url)
+        return (s, url, ok)
+
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        fut2url = {ex.submit(fetch, u): u for u in urls}
-        for fut in as_completed(fut2url):
-            u = fut2url[fut]
-            try:
-                out[u] = fut.result()
-            except Exception:
-                out[u] = None
-    return out
+        futures = [ex.submit(head_one, it) for it in to_probe]
+        for fut in as_completed(futures):
+            s, url, ok = fut.result()
+            if ok:
+                results[s].append(url)
 
-def discover_sitemaps(sites: List[str]) -> List[str]:
-    smaps = []
-    for base in sites:
-        for path in SITEMAP_CANDIDATES:
-            sm_url = base.rstrip("/") + path
-            content = fetch(sm_url)
-            if not content:
+    # Fallback to small GET for anything still empty
+    still_empty = [s for s in sites if not results[s]]
+    for s in still_empty:
+        for c in candidate_sitemaps_for_site(s, include_gz=include_gz):
+            blob = http_get(c, timeout=REQ_TIMEOUT, first_bytes=2048)
+            if not blob:
                 continue
-            head = content[:2000].decode("utf-8", errors="ignore").lower()
+            head = blob[:2048].decode("utf-8", errors="ignore").lower()
             if "<urlset" in head or "<sitemapindex" in head:
-                smaps.append(sm_url)
-                break  # first match per site
-    return smaps
+                results[s].append(c); break
 
+    # Flatten and cache
+    all_smaps = []
+    for s in sites:
+        uniq = []
+        for u in results.get(s, []):
+            if u not in uniq:
+                uniq.append(u)
+        results[s] = uniq
+        all_smaps.extend(uniq)
+
+    # Save cache
+    try:
+        with open(SITEMAP_CACHE_JSON, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2)
+    except Exception:
+        pass
+
+    return all_smaps
+
+# ---------------------- Parsing / extraction -----------------------
 def parse_sitemap_xml(xml_bytes: bytes) -> Tuple[List[str], List[str]]:
     urls, children = [], []
     try:
@@ -147,14 +243,6 @@ def parse_sitemap_xml(xml_bytes: bytes) -> Tuple[List[str], List[str]]:
     urls = [u for u in urls if not any(x in u for x in ["/image_sitemap", "/video_sitemap"])]
     return urls, children
 
-def url_allowed(u: str, exclude_patterns: List[str]) -> bool:
-    path = urlparse(u).path.lower()
-    for p in exclude_patterns:
-        p = (p or "").strip().lower()
-        if p and p in path:
-            return False
-    return True
-
 def collect_urls_from_sitemaps(sitemap_urls: List[str]) -> List[str]:
     seen = set()
     to_visit = list(sitemap_urls)
@@ -166,7 +254,7 @@ def collect_urls_from_sitemaps(sitemap_urls: List[str]) -> List[str]:
             continue
         seen.add(sm_url)
 
-        xml = fetch(sm_url)
+        xml = http_get(sm_url, timeout=REQ_TIMEOUT, first_bytes=None)  # usually small
         if not xml:
             continue
         urls, children = parse_sitemap_xml(xml)
@@ -175,6 +263,14 @@ def collect_urls_from_sitemaps(sitemap_urls: List[str]) -> List[str]:
         if len(all_urls) >= MAX_URLS_PER_SITEMAP:
             break
     return list(dict.fromkeys(all_urls))
+
+def url_allowed(u: str, exclude_patterns: List[str]) -> bool:
+    path = urlparse(u).path.lower()
+    for p in exclude_patterns:
+        p = (p or "").strip().lower()
+        if p and p in path:
+            return False
+    return True
 
 def smart_extract_text(html_bytes: bytes):
     html = html_bytes.decode("utf-8", errors="ignore")
@@ -205,11 +301,11 @@ def smart_extract_text(html_bytes: bytes):
     return title or "(untitled)", text, preview
 
 def extract_main_content(url: str):
-    html = fetch(url)
-    if not html:
+    blob = http_get(url, timeout=REQ_TIMEOUT, first_bytes=None)
+    if not blob:
         return None, None, None
     try:
-        return smart_extract_text(html)
+        return smart_extract_text(blob)
     except Exception:
         return None, None, None
 
@@ -302,7 +398,7 @@ def make_query_vector(title: str, text: str, idf: Dict[str, float]) -> Tuple[Dic
     qnorm = math.sqrt(sum(w*w for w in qvec.values())) or 1.0
     return qvec, qnorm
 
-# ---------------------- ONTOLOGY & RANKING ------------------------
+# ---------------------- RANKING ------------------------
 def ontology_overlap_score(text: str) -> Tuple[float, str]:
     t = (text or "").lower()
     score = 0.0
@@ -399,6 +495,9 @@ def rank_related(
 # ---------------------- INDEX BUILD -------------------------------
 def build_index(
     selected_sites: List[str],
+    use_cache_sitemaps: bool,
+    check_robots: bool,
+    include_gz_candidates: bool,
     max_pages_per_site: int,
     max_workers: int,
     exclude_common: bool,
@@ -409,68 +508,70 @@ def build_index(
     if exclude_common:
         excludes = DEFAULT_EXCLUDE_SUBSTRINGS + excludes
 
-    st.info("Discovering sitemaps…")
-    sitemaps = discover_sitemaps(selected_sites)
-    if not sitemaps:
+    st.info("Discovering sitemaps… (fast mode)")
+    smaps = discover_sitemaps_fast(
+        selected_sites,
+        use_cache=use_cache_sitemaps,
+        check_robots=check_robots,
+        include_gz=include_gz_candidates,
+        max_workers=max_workers,
+        head_timeout=HEAD_TIMEOUT
+    )
+    if not smaps:
         st.error("No sitemaps found for the selected sites."); return
 
     # Collect URLs
-    all_urls = collect_urls_from_sitemaps(sitemaps)
+    all_urls = collect_urls_from_sitemaps(smaps)
+
     # Filter to selected domains and excludes
     allowed_domains = {urlparse(s).netloc for s in selected_sites}
     url_pool = [u for u in all_urls if urlparse(u).netloc in allowed_domains and url_allowed(u, excludes)]
-    # Enforce per‑site caps (keep most recent-looking first by appearance order)
-    per_site = {}
-    for u in url_pool:
-        d = urlparse(u).netloc
-        if per_site.get(d, 0) < max_pages_per_site:
-            per_site[d] = per_site.get(d, 0) + 1
-        else:
-            continue
 
-    capped_urls = []
-    counts = {d:0 for d in allowed_domains}
+    # Enforce per‑site caps
+    capped: List[str] = []
+    per_count: Dict[str, int] = {d: 0 for d in allowed_domains}
     for u in url_pool:
         d = urlparse(u).netloc
-        if counts[d] < max_pages_per_site:
-            capped_urls.append(u); counts[d]+=1
+        if per_count[d] < max_pages_per_site:
+            capped.append(u)
+            per_count[d] += 1
 
     # Load existing rows and skip already cached unless forced
-    existing_rows, existing_pack = load_index()
+    existing_rows, _ = load_index()
     existing_by_url = {r["url"]: r for r in existing_rows}
+    to_fetch = [u for u in capped if force_refresh or u not in existing_by_url]
 
-    to_fetch = [u for u in capped_urls if force_refresh or u not in existing_by_url]
-
-    st.write(f"Fetching {len(to_fetch)} new pages (max_workers={max_workers})…")
+    st.write(f"Fetching {len(to_fetch)} new pages (threads={max_workers})…")
     progress = st.progress(0.0)
-    fetched: Dict[str, Optional[bytes]] = {}
-    batch_size = max(1, len(to_fetch))
 
-    # Fetch concurrently
-    fetched = fetch_many(to_fetch, max_workers=max_workers)
-
-    # Extract content (also in threads)
-    def extract(u_bytes):
-        u, b = u_bytes
-        if not b: return u, None, None, None
+    # Concurrent fetch + extract
+    def fetch_and_extract(u: str):
+        blob = http_get(u, timeout=REQ_TIMEOUT, first_bytes=None)
+        if not blob:
+            return None
         try:
-            title, text, preview = smart_extract_text(b); return u, title, text, preview
+            title, text, preview = smart_extract_text(blob)
+            if text and len(text) >= 200:
+                return {"url": u, "title": title or "(untitled)", "text": text, "preview": preview, "domain": urlparse(u).netloc}
         except Exception:
-            return u, None, None, None
+            return None
+        return None
 
     results = []
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = [ex.submit(extract, item) for item in fetched.items()]
+        futs = [ex.submit(fetch_and_extract, u) for u in to_fetch]
+        total = max(1, len(futs))
         for i, fut in enumerate(as_completed(futs), 1):
-            u, title, text, preview = fut.result()
-            if text and len(text) >= 200:
-                results.append({"url": u, "title": title or "(untitled)", "text": text, "preview": preview, "domain": urlparse(u).netloc})
-            progress.progress(i / max(1, len(futs)))
+            r = fut.result()
+            if r: results.append(r)
+            progress.progress(i/total)
 
-    # Merge with existing rows
+    # Merge rows
     merged = list(existing_rows)
+    by_url = {m["url"]: m for m in merged}
     for r in results:
-        merged = [m for m in merged if m["url"] != r["url"]] + [r]
+        by_url[r["url"]] = r
+    merged = list(by_url.values())
 
     if not merged:
         st.warning("No articles were indexed (pages too short or blocked).")
@@ -486,7 +587,7 @@ st.set_page_config(page_title="Site Linker (Ultra‑light)", layout="wide")
 st.title("🔗 Site Linker — Cross‑Site Related Article Finder")
 st.caption("Ultra‑light build: pure‑Python TF‑IDF + pet ontology. Minimal dependencies.")
 
-# Site selection (checkboxes)
+# 1) Choose sites
 st.subheader("1) Choose sites to scan")
 cols = st.columns(3)
 selected_sites = []
@@ -495,35 +596,31 @@ for i, site in enumerate(ALL_SITES):
         if st.checkbox(site, value=True):
             selected_sites.append(site)
 
-# Speed / filtering controls
+# 2) Speed & filters
 st.subheader("2) Speed & filters")
 colA, colB, colC = st.columns([1,1,2])
 with colA:
-    max_pages_per_site = st.slider("Max pages per site", 20, 2000, 150, help="Hard cap of pages to fetch from each site (higher = slower).")
+    max_pages_per_site = st.slider("Max pages per site", 20, 2000, 120, help="Cap pages per site to keep builds quick.")
 with colB:
-    max_workers = st.slider("Concurrency (threads)", 1, 24, 12, help="Higher = faster, but be respectful to servers.")
+    max_workers = st.slider("Concurrency (threads)", 1, 24, 12, help="Higher = faster. Be kind to origin servers.")
 with colC:
     exclude_common = st.checkbox("Exclude common paths (/tag/, /category/, /page/, /feed/, /reviews/, /author/, /about/, /privacy/, /terms/, /contact/, /affiliate/, /advertise/)", value=True)
 
 extra_excludes = st.text_input("Extra paths to exclude (comma‑separated, optional)", value="")
+force_refresh = st.checkbox("Force re-crawl even if cached", value=False)
 
-force_refresh = st.checkbox("Force re-crawl even if cached", value=False, help="If off, previously indexed pages are reused to speed up builds.")
+# Advanced discovery (fast mode)
+with st.expander("Advanced sitemap discovery (fast mode)"):
+    use_cache_sitemaps = st.checkbox("Use sitemap cache", value=True)
+    check_robots = st.checkbox("Check robots.txt for sitemap hints", value=True)
+    include_gz_candidates = st.checkbox("Try .gz sitemap candidates", value=False)
 
-# Big visible Build button
-st.subheader("3) Build or refresh the index")
-build_clicked = st.button("🔄 BUILD / REFRESH INDEX", type="primary", use_container_width=True, disabled=(len(selected_sites)==0))
-
-if build_clicked:
-    if not selected_sites:
-        st.error("Pick at least one site.")
-    else:
-        build_index(selected_sites, max_pages_per_site, max_workers, exclude_common, extra_excludes, force_refresh)
-        st.experimental_rerun()
-
-# Load index for search tabs
+# Load index (for searching)
 rows, pack = load_index()
 st.write(f"**Indexed articles:** {len(rows)}")
 
+# 3) Search tabs
+st.subheader("3) Search for related links")
 tab1, tab2 = st.tabs(["🔎 Find by URL", "📝 Find by pasted text"])
 
 with tab1:
@@ -532,7 +629,7 @@ with tab1:
     k = st.slider("How many suggestions?", 3, 20, 8)
     disabled = len(rows)==0
     if disabled:
-        st.info("Index is empty. Build the index above first.")
+        st.info("Index is empty. Build the index at the bottom first.")
     if st.button("Find related (by URL)", disabled=disabled):
         try:
             t_title, t_text, _ = extract_main_content(url)
@@ -564,7 +661,7 @@ with tab2:
     k2 = st.slider("How many suggestions? ", 3, 20, 8, key="k2")
     disabled2 = len(rows)==0 or not t_text.strip()
     if len(rows)==0:
-        st.info("Index is empty. Build the index above first.")
+        st.info("Index is empty. Build the index at the bottom first.")
     if st.button("Find related (by text)", disabled=disabled2):
         results = rank_related(t_title, t_text, rows, pack, same_domain_only=(prefer_domain or None))
         table = [{
@@ -575,6 +672,29 @@ with tab2:
             "Why": r["why"]
         } for r in results[:k2]]
         st.dataframe(table, use_container_width=True)
+
+# 4) Big Build button AT THE BOTTOM
+st.markdown("---")
+st.subheader("4) Build or refresh the index")
+build_clicked = st.button("🔄 BUILD / REFRESH INDEX", type="primary", use_container_width=True, disabled=(len(selected_sites)==0))
+
+if build_clicked:
+    if not selected_sites:
+        st.error("Pick at least one site.")
+    else:
+        build_index(
+            selected_sites=selected_sites,
+            use_cache_sitemaps=use_cache_sitemaps,
+            check_robots=check_robots,
+            include_gz_candidates=include_gz_candidates,
+            max_pages_per_site=max_pages_per_site,
+            max_workers=max_workers,
+            exclude_common=exclude_common,
+            extra_excludes_text=extra_excludes,
+            force_refresh=force_refresh,
+        )
+        # Rerun so the new index count and tabs enable immediately
+        st.rerun()
 
 st.markdown("---")
 st.caption("Scoring = 0.70×TF‑IDF + 0.20×ontology(candidate) + 0.10×ontology(target) − species mismatch penalty.")
