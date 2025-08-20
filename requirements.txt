@@ -1,8 +1,7 @@
 streamlit==1.37.0
 requests==2.32.3
 beautifulsoup4==4.12.3
-lxml==5.2.2
-readability-lxml==0.8.1
+html5lib==1.1
 sentence-transformers==2.2.2
 scikit-learn==1.5.1
 numpy==1.26.4

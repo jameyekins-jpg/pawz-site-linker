@@ -1,3 +1,7 @@
+v0.1.1 — Remove lxml/readability to fix Streamlit build
+- Replaced lxml & readability-lxml with stdlib XML + BeautifulSoup(html5lib)
+- Keeps sitemap parsing and content extraction lightweight and portable
+
 v0.1.0 — Initial release
 - One-file Streamlit app to build a cross-site internal linking index from sitemaps
 - Semantic similarity (all-MiniLM-L6-v2) + pet-topic ontology scoring
