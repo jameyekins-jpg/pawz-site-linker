@@ -1,11 +1,9 @@
+v0.3.1 — Faster UX + controls
+- Per-site checkboxes before building (choose exactly which domains to crawl)
+- Big, visible 'BUILD / REFRESH INDEX' button (always on the page)
+- Speed controls: max pages per site, concurrency (threads), and path filters
+- Reuses cached pages unless 'Force re-crawl' is checked (much faster)
+
 v0.3.0 — Ultra‑light build
 - Removed scikit‑learn, numpy, pandas to eliminate heavy wheels
 - Implemented pure‑Python TF‑IDF + cosine similarity
-- Same UI and features (CSV export removed to avoid pandas dep)
-
-v0.2.0 — TF-IDF edition
-- Removed sentence-transformers / PyTorch
-- Used scikit-learn TF‑IDF + ontology scoring
-
-v0.1.1 — Removed lxml/readability to fix build
-v0.1.0 — Initial release
