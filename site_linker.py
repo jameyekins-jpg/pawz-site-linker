@@ -1,11 +1,11 @@
 # site_linker.py
 # ------------------------------------------------------------
 # Multi-site related-article finder for internal linking (MVP)
-# GitHub → Streamlit ready. No external system deps.
-# This version REMOVES lxml/readability to avoid build failures on Streamlit.
+# Streamlit-ready, no heavy deps (no PyTorch / sentence-transformers / lxml).
+# Uses TF-IDF similarity + a small ontology for scoring.
 # ------------------------------------------------------------
 
-import os, io, json, time, pickle
+import os, pickle
 from typing import List, Tuple, Dict, Optional
 
 import streamlit as st
@@ -15,7 +15,7 @@ import pandas as pd
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 import xml.etree.ElementTree as ET
-from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
 # ---------------------- USER EDITABLE: SITES ----------------------
@@ -64,8 +64,7 @@ ONTOLOGY = {
 # ---------------------- CONFIG / CONSTANTS ------------------------
 CACHE_DIR = "data"
 ARTICLES_PKL = os.path.join(CACHE_DIR, "articles.pkl")
-EMBEDS_NPY  = os.path.join(CACHE_DIR, "embeddings.npy")
-MODEL_NAME  = "sentence-transformers/all-MiniLM-L6-v2"
+TFIDF_PKL  = os.path.join(CACHE_DIR, "tfidf.pkl")
 REQUEST_TIMEOUT = 20
 MAX_URLS_PER_SITEMAP = 5000  # safety cap
 
@@ -75,7 +74,7 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 def user_agent() -> Dict[str, str]:
     return {"User-Agent": "Mozilla/5.0 (compatible; SiteLinker/1.0)"}
 
-def fetch(url: str) -> Optional[bytes]:
+def fetch(url: str):
     try:
         r = requests.get(url, timeout=REQUEST_TIMEOUT, headers=user_agent())
         if r.status_code == 200:
@@ -99,7 +98,6 @@ def discover_sitemaps() -> List[str]:
     return smaps
 
 def parse_sitemap_xml(xml_bytes: bytes) -> Tuple[List[str], List[str]]:
-    """Returns (urls, child_sitemaps). Uses stdlib XML parser to avoid lxml build issues."""
     urls, children = [], []
     try:
         root = ET.fromstring(xml_bytes.decode("utf-8", errors="ignore"))
@@ -145,26 +143,22 @@ def collect_urls_from_sitemap(start_url: str) -> List[str]:
             break
     return list(dict.fromkeys(all_urls))
 
-def smart_extract_text(html_bytes: bytes) -> Tuple[str, str, str]:
-    """Extract title + main text without readability-lxml.
-    Heuristics: article > main > divs with contenty classnames. Fallback to all text.
-    """
+def smart_extract_text(html_bytes: bytes):
+    """Extract title + main text using BeautifulSoup only."""
     html = html_bytes.decode("utf-8", errors="ignore")
     soup = BeautifulSoup(html, "html5lib")
 
     # Title and H1
     title = (soup.title.string.strip() if soup.title and soup.title.string else "")
-
     h1 = soup.find("h1")
     if h1 and h1.get_text(strip=True):
         title = h1.get_text(strip=True)
 
-    # Prefer <article>
+    # Prefer <article>, then <main>, else heuristics
     main_node = soup.find("article")
     if not main_node:
         main_node = soup.find("main")
     if not main_node:
-        # common WP content containers
         candidates = soup.find_all(["div", "section"], class_=True)
         best = None
         best_len = 0
@@ -180,7 +174,7 @@ def smart_extract_text(html_bytes: bytes) -> Tuple[str, str, str]:
     preview = text[:600] + ("…" if len(text) > 600 else "")
     return title or "(untitled)", text, preview
 
-def extract_main_content(url: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def extract_main_content(url: str):
     html = fetch(url)
     if not html:
         return None, None, None
@@ -189,27 +183,25 @@ def extract_main_content(url: str) -> Tuple[Optional[str], Optional[str], Option
     except Exception:
         return None, None, None
 
-def text_for_embedding(title: str, text: str) -> str:
-    return ((title or "") + "\n\n" + (text or "")[:1200]).strip()
-
-@st.cache_resource(show_spinner=False)
-def load_model():
-    return SentenceTransformer(MODEL_NAME)
+def text_for_index(title: str, text: str) -> str:
+    return ((title or "") + "\n\n" + (text or "")[:2000]).strip()
 
 def load_index():
-    if not (os.path.exists(ARTICLES_PKL) and os.path.exists(EMBEDS_NPY)):
-        return [], None
+    if not (os.path.exists(ARTICLES_PKL) and os.path.exists(TFIDF_PKL)):
+        return [], None, None
     with open(ARTICLES_PKL, "rb") as f:
         rows = pickle.load(f)
-    X = np.load(EMBEDS_NPY)
-    return rows, X
+    with open(TFIDF_PKL, "rb") as f:
+        pack = pickle.load(f)
+    return rows, pack["X"], pack["vectorizer"]
 
-def save_index(rows: List[Dict]):
+def save_index(rows, X, vectorizer):
     with open(ARTICLES_PKL, "wb") as f:
         pickle.dump(rows, f)
-    np.save(EMBEDS_NPY, np.vstack([r["embedding"] for r in rows]))
+    with open(TFIDF_PKL, "wb") as f:
+        pickle.dump({"X": X, "vectorizer": vectorizer}, f)
 
-def ontology_overlap_score(text: str) -> Tuple[float, str]:
+def ontology_overlap_score(text: str):
     t = (text or "").lower()
     score = 0.0
     detail = []
@@ -238,10 +230,8 @@ def species_penalty(a_text: str, b_text: str) -> float:
     cA = get(a_text, ONTOLOGY["species"]["cat"])
     dB = get(b_text, ONTOLOGY["species"]["dog"])
     cB = get(b_text, ONTOLOGY["species"]["cat"])
-    if dA > cA and cB > dB:
-        return 0.07
-    if cA > dA and dB > cB:
-        return 0.07
+    if dA > cA and cB > dB: return 0.07
+    if cA > dA and dB > cB: return 0.07
     return 0.0
 
 def suggest_anchor(text: str) -> str:
@@ -251,22 +241,21 @@ def suggest_anchor(text: str) -> str:
     if "glucosamine" in t or "supplement" in t: anchors.append("joint supplements for mobility")
     if "exercise" in t or "low-impact" in t: anchors.append("low-impact exercise for older dogs")
     if "hip dysplasia" in t: anchors.append("hip dysplasia support")
-    if not anchors:
-        anchors.append("help for senior dog mobility")
+    if not anchors: anchors.append("help for senior dog mobility")
     return ", ".join(anchors[:2])
 
-def rank_related(
+def rank_related_tfidf(
     target_title: str,
     target_text: str,
-    rows: List[Dict],
-    X: np.ndarray,
+    rows,
+    X,
+    vectorizer: TfidfVectorizer,
     same_domain_only: Optional[str] = None,
     min_words: int = 200
-) -> List[Dict]:
-    if not rows or X is None:
+):
+    if not rows or X is None or vectorizer is None:
         return []
-    model = load_model()
-    q = model.encode([text_for_embedding(target_title, target_text)], normalize_embeddings=True)
+    q = vectorizer.transform([text_for_index(target_title, target_text)])
     sims = cosine_similarity(q, X)[0]
 
     out = []
@@ -283,7 +272,7 @@ def rank_related(
         penalty = species_penalty(target_text, r["text"])
 
         final = (
-            0.55 * float(sims[i]) +
+            0.65 * float(sims[i]) +    # TF-IDF similarity carries a bit more weight here
             0.25 * (min(ont_cand, 5.0) / 5.0) +
             0.10 * (min(ont_tgt, 5.0) / 5.0) -
             penalty
@@ -295,7 +284,7 @@ def rank_related(
             "domain": r["domain"],
             "preview": r["preview"],
             "sim": float(sims[i]),
-            "why": f"semantic:{round(float(sims[i]),3)} | {ont_detail}",
+            "why": f"tfidf:{round(float(sims[i]),3)} | {ont_detail}",
             "anchor": suggest_anchor(r["text"]),
             "score": final
         })
@@ -303,7 +292,6 @@ def rank_related(
     return out
 
 def build_index(sitemap_urls: List[str]):
-    model = load_model()
     all_urls: List[str] = []
 
     st.info("Collecting URLs from sitemaps…")
@@ -325,17 +313,13 @@ def build_index(sitemap_urls: List[str]):
     for i, url in enumerate(all_urls, 1):
         title, text, preview = extract_main_content(url)
         if not text or len(text) < 200:
-            progress.progress(i / total)
-            continue
-
-        emb = model.encode([text_for_embedding(title, text)], normalize_embeddings=True)[0]
+            progress.progress(i / total); continue
         rows.append({
             "url": url,
             "title": title or "(untitled)",
             "text": text,
             "preview": preview,
-            "domain": urlparse(url).netloc,
-            "embedding": emb.astype(np.float32)
+            "domain": urlparse(url).netloc
         })
         progress.progress(i / total)
 
@@ -343,13 +327,22 @@ def build_index(sitemap_urls: List[str]):
         st.warning("No articles were indexed (pages too short or blocked).")
         return
 
-    save_index(rows)
+    # Build TF-IDF index
+    docs = [text_for_index(r["title"], r["text"]) for r in rows]
+    vectorizer = TfidfVectorizer(ngram_range=(1,2), max_df=0.85, min_df=2, stop_words="english")
+    X = vectorizer.fit_transform(docs)
+
+    with open(ARTICLES_PKL, "wb") as f:
+        pickle.dump(rows, f)
+    with open(TFIDF_PKL, "wb") as f:
+        pickle.dump({"X": X, "vectorizer": vectorizer}, f)
+
     st.success(f"Indexed {len(rows)} articles.")
 
 # ---------------------- UI ---------------------------------------
 st.set_page_config(page_title="Site Linker (Multi-Site Internal Linking)", layout="wide")
 st.title("🔗 Site Linker — Cross-Site Related Article Finder")
-st.caption("Paste a URL or text. I’ll find related articles across Technomeow, Technobark, DogVills, PetParentAdvisor, and SeniorPups using semantic + ontology scoring.")
+st.caption("TF‑IDF similarity + pet ontology. No heavy dependencies.")
 
 with st.expander("⚙️ Index controls"):
     col1, col2, col3 = st.columns([1,1,2])
@@ -363,13 +356,13 @@ with st.expander("⚙️ Index controls"):
                 st.experimental_rerun()
     with col2:
         if st.button("🗑 Clear Cache Files"):
-            for p in [ARTICLES_PKL, EMBEDS_NPY]:
+            for p in [ARTICLES_PKL, TFIDF_PKL]:
                 if os.path.exists(p): os.remove(p)
             st.success("Cache cleared. Click refresh to rebuild.")
     with col3:
         st.write("**Tip:** Refresh after new posts or weekly. Searches stay fast between refreshes.")
 
-rows, X = load_index()
+rows, X, vectorizer = load_index()
 st.write(f"**Indexed articles:** {len(rows)}")
 
 tab1, tab2 = st.tabs(["🔎 Find by URL", "📝 Find by pasted text"])
@@ -387,7 +380,7 @@ with tab1:
             else:
                 domain = urlparse(url).netloc
                 domain_filter = domain if prefer_same_site else None
-                results = rank_related(t_title, t_text, rows, X, same_domain_only=domain_filter)
+                results = rank_related_tfidf(t_title, t_text, rows, X, vectorizer, same_domain_only=domain_filter)
                 if prefer_same_site:
                     same = [r for r in results if r["domain"] == domain]
                     cross = [r for r in results if r["domain"] != domain]
@@ -411,7 +404,7 @@ with tab2:
     k2 = st.slider("How many suggestions? ", 3, 20, 8, key="k2")
 
     if st.button("Find related (by text)", disabled=(len(rows)==0 or not t_text.strip())):
-        results = rank_related(t_title, t_text, rows, X, same_domain_only=(prefer_domain or None))
+        results = rank_related_tfidf(t_title, t_text, rows, X, vectorizer, same_domain_only=(prefer_domain or None))
         df = pd.DataFrame([{
             "Score": round(r["score"],3),
             "Title": r["title"],
@@ -423,4 +416,4 @@ with tab2:
         st.download_button("⬇️ Export CSV", df.to_csv(index=False).encode("utf-8"), file_name="related_links.csv", mime="text/csv")
 
 st.markdown("---")
-st.caption("Scoring = 0.55×semantic + 0.25×ontology(candidate) + 0.10×ontology(target) − species mismatch penalty. Edit ONTOLOGY in this file to tune.")
+st.caption("Scoring = 0.65×TF‑IDF + 0.25×ontology(candidate) + 0.10×ontology(target) − species mismatch penalty. You can tune ONTOLOGY in this file.")
