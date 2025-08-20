@@ -1,8 +1,8 @@
 # site_linker.py
 # ------------------------------------------------------------
 # Multi-site related-article finder for internal linking (MVP)
-# Streamlit-ready, no heavy deps (no PyTorch / sentence-transformers / lxml).
-# Uses TF-IDF similarity + a small ontology for scoring.
+# Streamlit-ready, no heavy deps (no PyTorch / no lxml).
+# Uses scikit-learn TF-IDF similarity + a small ontology for scoring.
 # ------------------------------------------------------------
 
 import os, pickle
@@ -332,11 +332,7 @@ def build_index(sitemap_urls: List[str]):
     vectorizer = TfidfVectorizer(ngram_range=(1,2), max_df=0.85, min_df=2, stop_words="english")
     X = vectorizer.fit_transform(docs)
 
-    with open(ARTICLES_PKL, "wb") as f:
-        pickle.dump(rows, f)
-    with open(TFIDF_PKL, "wb") as f:
-        pickle.dump({"X": X, "vectorizer": vectorizer}, f)
-
+    save_index(rows, X, vectorizer)
     st.success(f"Indexed {len(rows)} articles.")
 
 # ---------------------- UI ---------------------------------------
