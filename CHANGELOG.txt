@@ -1,10 +1,11 @@
-v0.1.1 — Remove lxml/readability to fix Streamlit build
-- Replaced lxml & readability-lxml with stdlib XML + BeautifulSoup(html5lib)
-- Keeps sitemap parsing and content extraction lightweight and portable
+v0.3.0 — Ultra‑light build
+- Removed scikit‑learn, numpy, pandas to eliminate heavy wheels
+- Implemented pure‑Python TF‑IDF + cosine similarity
+- Same UI and features (CSV export removed to avoid pandas dep)
 
+v0.2.0 — TF-IDF edition
+- Removed sentence-transformers / PyTorch
+- Used scikit-learn TF‑IDF + ontology scoring
+
+v0.1.1 — Removed lxml/readability to fix build
 v0.1.0 — Initial release
-- One-file Streamlit app to build a cross-site internal linking index from sitemaps
-- Semantic similarity (all-MiniLM-L6-v2) + pet-topic ontology scoring
-- “Find by URL” and “Find by pasted text” flows
-- Same-site preference toggle, CSV export
-- Auto-discovery of /sitemap_index.xml or /sitemap.xml for each site
