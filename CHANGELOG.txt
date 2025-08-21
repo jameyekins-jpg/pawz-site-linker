@@ -1,5 +1,3 @@
-v0.3.3 — UX + speed + crash fix
-- Build button moved to the **bottom** of the page
-- Faster sitemap discovery using robots.txt hints, concurrent HEAD probes, and caching
-- Fixed crash by replacing `st.experimental_rerun()` with `st.rerun()`
-- Keeps per-site checkboxes, concurrency, per-site page cap, and exclude filters
+v0.2.0 — TF-IDF edition (fast build)
+- Removed sentence-transformers (and PyTorch)
+- Uses scikit-learn TF‑IDF similarity + ontology scoring
